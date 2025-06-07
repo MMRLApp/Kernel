@@ -96,9 +96,16 @@ static void crown_manager(const char *apk_path, struct list_head *uid_data, int 
             bool signature_requirements_met = false;
 
             if (manager_pkgs[i].expected_hash == NULL) {
-                // Signature check is explicitly ignored for this package entry
+                // This entry is configured to potentially skip signature check.
+                // Only allow skipping if this is a debug build.
+#ifdef CONFIG_KSU_DEBUG
                 signature_requirements_met = true;
-                pr_info("Signature check IGNORED for manager package: %s\n", pkg_name);
+                pr_info("Signature check IGNORED for manager package (debug build): %s\n", pkg_name);
+#else
+                // Not a debug build, so a NULL hash means the signature check effectively fails.
+                signature_requirements_met = false;
+                pr_warn("Manager package %s configured to ignore signature, but this is NOT a debug build. Signature check FAILED.\n", pkg_name);
+#endif
             } else {
                 // A specific signature is provided, check against it
                 pr_info("Checking specific signature for %s: (size %u, hash %.10s...)\n",
