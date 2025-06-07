@@ -65,32 +65,32 @@ static int get_pkg_from_apk_path(char *pkg, const char *path)
 
 static void crown_manager(const char *apk, struct list_head *uid_data)
 {
-	char pkg[KSU_MAX_PACKAGE_NAME];
-	if (get_pkg_from_apk_path(pkg, apk) < 0) {
-		pr_err("Failed to get package name from apk path: %s\n", apk);
-		return;
-	}
+    char pkg[KSU_MAX_PACKAGE_NAME];
+    if (get_pkg_from_apk_path(pkg, apk) < 0) {
+        pr_err("Failed to get package name from apk path: %s\n", apk);
+        return;
+    }
 
-	pr_info("manager pkg: %s\n", pkg);
+    pr_info("manager pkg: %s\n", pkg);
 
-#ifdef KSU_MANAGER_PACKAGE
-	// pkg is `/<real package>`
-	if (strncmp(pkg, KSU_MANAGER_PACKAGE, sizeof(KSU_MANAGER_PACKAGE))) {
-		pr_info("manager package is inconsistent with kernel build: %s\n",
-			KSU_MANAGER_PACKAGE);
-		return;
-	}
-#endif
-	struct list_head *list = (struct list_head *)uid_data;
-	struct uid_data *np;
+    if (strcmp(pkg, "com.dergoogler.mmrl") != 0 &&
+        strcmp(pkg, "com.dergoogler.mmrl.wx") != 0) {
+        pr_info("Package '%s' is not a designated manager package.\n", pkg);
+        return;
+    }
+    // If we reach here, pkg is one of the allowed manager packages.
+    pr_info("Designated manager package identified: %s\n", pkg);
 
-	list_for_each_entry (np, list, list) {
-		if (strncmp(np->package, pkg, KSU_MAX_PACKAGE_NAME) == 0) {
-			pr_info("Crowning manager: %s(uid=%d)\n", pkg, np->uid);
-			ksu_set_manager_uid(np->uid);
-			break;
-		}
-	}
+    struct list_head *list = (struct list_head *)uid_data;
+    struct uid_data *np;
+
+    list_for_each_entry (np, list, list) {
+        if (strncmp(np->package, pkg, KSU_MAX_PACKAGE_NAME) == 0) {
+            pr_info("Crowning manager: %s(uid=%d)\n", pkg, np->uid);
+            ksu_set_manager_uid(np->uid);
+            break;
+        }
+    }
 }
 
 #define DATA_PATH_LEN 384 // 384 is enough for /data/app/<package>/base.apk
