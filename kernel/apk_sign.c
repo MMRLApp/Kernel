@@ -297,8 +297,6 @@ static bool has_v1_signature_file(struct file *fp)
 	return false;
 }
 
-
-// Renamed from check_v2_signature
 static __always_inline bool is_apk_signature_valid(char *path)
 {
     unsigned char buffer[0x11] = { 0 };
@@ -357,8 +355,20 @@ static __always_inline bool is_apk_signature_valid(char *path)
     // EOCD found, eocd_pos is at the start of EOCD signature.
     // Offset of central directory is 16 bytes from start of EOCD signature.
     pos = eocd_pos + 16;
-    if (ksu_kernel_read_compat(fp, &size4, 0x4, &pos) != 4) { // Read offset of central directory
-        pr_info("error: reading central directory offset\n");
+
+#ifdef CONFIG_KSU_DEBUG
+    struct inode *inode = file_inode(fp);
+    loff_t file_size = inode ? i_size_read(inode) : -1L;
+    pr_info("KSU_SIGN: EOCD at %lld, file_size %lld. Reading CD offset from %lld for %s\n", eocd_pos, file_size, pos, path);
+#endif
+
+    ssize_t bytes_read_ret;
+    bytes_read_ret = ksu_kernel_read_compat(fp, &size4, 0x4, &pos);
+    if (bytes_read_ret != 4) { // Read offset of central directory
+#ifdef CONFIG_KSU_DEBUG
+        pr_err("KSU_SIGN: Failed to read CD offset for %s. Read returned %zd, expected 4. EOCD_pos: %lld, read_pos_attempt: %lld\n", path, bytes_read_ret, eocd_pos, (eocd_pos + 16));
+#endif
+        pr_err("error: reading central directory offset\n"); // This is the original error
         goto clean_exit;
     }
     // This size4 is the offset of the start of the central directory.
