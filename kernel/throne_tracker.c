@@ -72,12 +72,25 @@ static void crown_manager(const char *apk, struct list_head *uid_data)
     }
 
     pr_info("manager pkg: %s\n", pkg);
+	static const char *manager_pkgs[] = {
+		"com.dergoogler.mmrl",
+		"com.dergoogler.mmrl.debug",
+		"com.dergoogler.mmrl.wx",
+		"com.dergoogler.mmrl.wx.debug",
+		NULL
+	};
 
-    if (strcmp(pkg, "com.dergoogler.mmrl") != 0 &&
-        strcmp(pkg, "com.dergoogler.mmrl.wx") != 0) {
-        pr_info("Package '%s' is not a designated manager package.\n", pkg);
-        return;
-    }
+	bool found = false;
+	for (int i = 0; manager_pkgs[i] != NULL; i++) {
+		if (strcmp(pkg, manager_pkgs[i]) == 0) {
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		pr_info("Package '%s' is not a designated manager package.\n", pkg);
+		return;
+	}
     // If we reach here, pkg is one of the allowed manager packages.
     pr_info("Designated manager package identified: %s\n", pkg);
 
