@@ -80,24 +80,20 @@ static int ksu_sha256(const unsigned char *data, unsigned int datalen,
 	return ret;
 }
 
-static bool check_block(struct file *fp, u32 *size4_buf, loff_t *pos, u32 *offset)
+static bool check_block(struct file *fp, u32 *size4_buf, loff_t *pos, u32 *offset,
+            const struct ksu_cert_check_params *target_key)
 {
     loff_t original_pos = *pos;
-    u32 initial_offset = *offset; // Save initial offset to calculate total consumed by this function
+    u32 initial_offset = *offset;
 
     ksu_kernel_read_compat(fp, size4_buf, 0x4, pos); // signer length
-    // *offset += 4; // This offset is relative to the start of the ID-value pair's value
     ksu_kernel_read_compat(fp, size4_buf, 0x4, pos); // signed data length
-    // *offset += 4;
     ksu_kernel_read_compat(fp, size4_buf, 0x4, pos); // digests-sequence length
-    // *offset += 4;
     
     u32 digests_len = *size4_buf;
     *pos += digests_len; // Skip digests body
-    // *offset += digests_len;
 
     ksu_kernel_read_compat(fp, size4_buf, 0x4, pos); // certificates-sequence length
-    // *offset += 4;
     u32 certs_sequence_len = *size4_buf;
     loff_t certs_sequence_end_pos = *pos + certs_sequence_len;
     bool found_matching_key = false;
@@ -105,37 +101,42 @@ static bool check_block(struct file *fp, u32 *size4_buf, loff_t *pos, u32 *offse
     while (*pos < certs_sequence_end_pos && !found_matching_key) {
         u32 current_cert_len;
         ksu_kernel_read_compat(fp, &current_cert_len, 0x4, pos);
-        // *offset += 4;
 
         if (current_cert_len == 0 || current_cert_len > CERT_MAX_LENGTH) {
             pr_info("Invalid or too long certificate in v2 block: len %u\n", current_cert_len);
-            *pos = certs_sequence_end_pos; // Skip rest of certs sequence
+            *pos = certs_sequence_end_pos; 
             break;
         }
 
-        char cert_data_buf[CERT_MAX_LENGTH]; // Re-declare to ensure it's on stack if CERT_MAX_LENGTH is large
-        if (current_cert_len > sizeof(cert_data_buf)) { // Should not happen due to CERT_MAX_LENGTH check
+        char cert_data_buf[CERT_MAX_LENGTH]; 
+        if (current_cert_len > sizeof(cert_data_buf)) { 
             pr_err("V2 cert len %u exceeds buffer %zu\n", current_cert_len, sizeof(cert_data_buf));
-            *pos += current_cert_len; // Skip this cert's data
-            // *offset += current_cert_len;
+            *pos += current_cert_len; 
             continue;
         }
 
-        ksu_kernel_read_compat(fp, cert_data_buf, current_cert_len, pos); // Read cert data, *pos advances
-        // *offset += current_cert_len;
+        ksu_kernel_read_compat(fp, cert_data_buf, current_cert_len, pos);
 
-        for (int i = 0; i < ARRAY_SIZE(apk_sign_keys); i++) {
-            if (current_cert_len == apk_sign_keys[i].size) {
-                unsigned char digest[SHA256_DIGEST_SIZE];
-                if (IS_ERR(ksu_sha256(cert_data_buf, current_cert_len, digest))) {
-                    pr_info("v2 sha256 error for cert\n");
-                    continue;
-                }
-                char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
-                bin2hex(hash_str, digest, SHA256_DIGEST_SIZE);
-                hash_str[SHA256_DIGEST_SIZE * 2] = '\0';
-                if (strcmp(apk_sign_keys[i].sha256, hash_str) == 0) {
-                    pr_info("v2 signature match: key %d, hash %s\n", i, hash_str);
+        unsigned char digest[SHA256_DIGEST_SIZE];
+        if (IS_ERR(ksu_sha256(cert_data_buf, current_cert_len, digest))) {
+            pr_info("v2 sha256 error for cert\n");
+            continue;
+        }
+        char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
+        bin2hex(hash_str, digest, SHA256_DIGEST_SIZE);
+        hash_str[SHA256_DIGEST_SIZE * 2] = '\0';
+
+        if (target_key) { // Check against a specific key if provided
+            if (current_cert_len == target_key->size &&
+                strcmp(target_key->sha256, hash_str) == 0) {
+                pr_info("v2 signature match (specific key): hash %s\n", hash_str);
+                found_matching_key = true;
+            }
+        } else { // Fallback to global apk_sign_keys
+            for (int i = 0; i < ARRAY_SIZE(apk_sign_keys); i++) {
+                if (current_cert_len == apk_sign_keys[i].size &&
+                    strcmp(apk_sign_keys[i].sha256, hash_str) == 0) {
+                    pr_info("v2 signature match (global key %d): hash %s\n", i, hash_str);
                     found_matching_key = true;
                     break; 
                 }
@@ -143,42 +144,27 @@ static bool check_block(struct file *fp, u32 *size4_buf, loff_t *pos, u32 *offse
         }
     }
 
-    *pos = certs_sequence_end_pos; // Ensure pos is at the end of certificates sequence
-    *offset = initial_offset + (*pos - original_pos); // Update offset with total bytes consumed by this function
+    *pos = certs_sequence_end_pos;
+    *offset = initial_offset + (*pos - original_pos);
 
     return found_matching_key;
 }
 
-// New function for v3 APK Signers
-static bool check_v3_apk_signer(struct file *fp, u32 *size4_buf, loff_t *pos, u32 *offset) {
+static bool check_v3_apk_signer(struct file *fp, u32 *size4_buf, loff_t *pos, u32 *offset,
+                const struct ksu_cert_check_params *target_key) {
     loff_t original_pos_in_signer = *pos;
-    u32 initial_offset_val = *offset; // Save initial offset
+    u32 initial_offset_val = *offset;
 
-    // A v3 block's value is a sequence of length-prefixed signers.
-    // This function is called for one such ID-value pair (the v3 block).
-    // We will parse the first signer in this v3 block.
-    // A more complete impl would loop through all signers in the v3 block.
-
-    // Read signer length (this is the length of the first signer in the sequence)
-    // ksu_kernel_read_compat(fp, size4_buf, 0x4, pos); 
-    // u32 signer_total_len = *size4_buf;
-    // loff_t signer_end_pos = *pos + signer_total_len;
-    // For simplicity, we'll parse fields sequentially and assume one primary signer.
-
-    // Read signed_data_len for the first signer
-    ksu_kernel_read_compat(fp, size4_buf, 0x4, pos);
+    ksu_kernel_read_compat(fp, size4_buf, 0x4, pos); // signed_data_len
     u32 signed_data_len = *size4_buf;
-    loff_t signed_data_start_pos = *pos;
+    // loff_t signed_data_start_pos = *pos; // Not used
     loff_t signed_data_end_pos = *pos + signed_data_len;
 
-    // Inside signed_data:
-    // 1. digests sequence (length-prefixed)
-    ksu_kernel_read_compat(fp, size4_buf, 0x4, pos);
+    ksu_kernel_read_compat(fp, size4_buf, 0x4, pos); // digests sequence length
     u32 digests_sequence_len = *size4_buf;
     *pos += digests_sequence_len; // Skip digests
 
-    // 2. certificates sequence (length-prefixed)
-    ksu_kernel_read_compat(fp, size4_buf, 0x4, pos);
+    ksu_kernel_read_compat(fp, size4_buf, 0x4, pos); // certificates sequence length
     u32 certs_sequence_len = *size4_buf;
     loff_t certs_sequence_end_pos = *pos + certs_sequence_len;
     bool found_matching_key = false;
@@ -189,7 +175,7 @@ static bool check_v3_apk_signer(struct file *fp, u32 *size4_buf, loff_t *pos, u3
 
         if (current_cert_len == 0 || current_cert_len > CERT_MAX_LENGTH) {
             pr_info("Invalid or too long certificate in v3 block: len %u\n", current_cert_len);
-            *pos = certs_sequence_end_pos; // Skip rest of certs sequence
+            *pos = certs_sequence_end_pos;
             break;
         }
         
@@ -202,18 +188,26 @@ static bool check_v3_apk_signer(struct file *fp, u32 *size4_buf, loff_t *pos, u3
 
         ksu_kernel_read_compat(fp, cert_data_buf, current_cert_len, pos);
 
-        for (int i = 0; i < ARRAY_SIZE(apk_sign_keys); i++) {
-            if (current_cert_len == apk_sign_keys[i].size) {
-                unsigned char digest[SHA256_DIGEST_SIZE];
-                if (IS_ERR(ksu_sha256(cert_data_buf, current_cert_len, digest))) {
-                    pr_info("v3 sha256 error for cert\n");
-                    continue;
-                }
-                char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
-                bin2hex(hash_str, digest, SHA256_DIGEST_SIZE);
-                hash_str[SHA256_DIGEST_SIZE * 2] = '\0';
-                if (strcmp(apk_sign_keys[i].sha256, hash_str) == 0) {
-                    pr_info("v3 signature match: key %d, hash %s\n", i, hash_str);
+        unsigned char digest_buf[SHA256_DIGEST_SIZE]; // Renamed from 'digest' to avoid conflict
+        if (IS_ERR(ksu_sha256(cert_data_buf, current_cert_len, digest_buf))) {
+            pr_info("v3 sha256 error for cert\n");
+            continue;
+        }
+        char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
+        bin2hex(hash_str, digest_buf, SHA256_DIGEST_SIZE);
+        hash_str[SHA256_DIGEST_SIZE * 2] = '\0';
+
+        if (target_key) { // Check against a specific key if provided
+            if (current_cert_len == target_key->size &&
+                strcmp(target_key->sha256, hash_str) == 0) {
+                pr_info("v3 signature match (specific key): hash %s\n", hash_str);
+                found_matching_key = true;
+            }
+        } else { // Fallback to global apk_sign_keys
+            for (int i = 0; i < ARRAY_SIZE(apk_sign_keys); i++) {
+                if (current_cert_len == apk_sign_keys[i].size &&
+                    strcmp(apk_sign_keys[i].sha256, hash_str) == 0) {
+                    pr_info("v3 signature match (global key %d): hash %s\n", i, hash_str);
                     found_matching_key = true;
                     break;
                 }
@@ -221,24 +215,9 @@ static bool check_v3_apk_signer(struct file *fp, u32 *size4_buf, loff_t *pos, u3
         }
     }
     
-    *pos = certs_sequence_end_pos; // Ensure pos is at end of certs sequence
+    *pos = certs_sequence_end_pos; 
+    *pos = signed_data_end_pos; // Skip rest of signed_data
 
-    // Skip rest of signed_data (minSdk, maxSdk, additional_attributes)
-    *pos = signed_data_end_pos;
-
-    // For this simplified version, we assume that if a cert matches, the v3 signer is good enough.
-    // A full v3 verifier would parse signatures, public_key, proof-of-rotation etc.
-    // We need to ensure *pos is advanced to the end of this *one* signer we parsed,
-    // or rely on the caller to skip the rest of the v3 ID-value pair.
-    // The current logic updates *pos up to the end of signed_data.
-    // The caller uses `offset` to skip the rest of the ID-value pair.
-    // So, update `offset` with bytes consumed from `original_pos_in_signer`.
-    
-    // To correctly skip the rest of this specific signer (if there were multiple in the v3 block)
-    // and then the rest of the v3 block, we'd need the signer_total_len.
-    // For now, we've parsed one signer's certs.
-    // The caller's `pos_val_start + (size8_val_len - current_offset_in_val)` will skip the rest of the v3 block.
-    // So, `*offset` should reflect bytes consumed from the start of the v3 block's value.
     *offset = initial_offset_val + (*pos - original_pos_in_signer);
 
     return found_matching_key;
@@ -297,21 +276,21 @@ static bool has_v1_signature_file(struct file *fp)
 	return false;
 }
 
-static __always_inline bool is_apk_signature_valid(char *path)
+static __always_inline bool __is_apk_signature_valid_common(const char *path, const struct ksu_cert_check_params *target_key)
 {
     unsigned char buffer[0x11] = { 0 };
-    u32 size4; // Used as a temporary buffer for reading u32 values
-    u64 size8_val_len; // Length of the current ID-value pair's value
-    u64 size_of_apk_sig_block; // Total size of the APK Signing Block
+    u32 size4; 
+    u64 size8_val_len; 
+    u64 size_of_apk_sig_block;
 
     loff_t pos;
-    loff_t eocd_pos; // Position of the EOCD record
+    loff_t eocd_pos; 
     loff_t apk_sig_block_start_pos;
 
     bool v2_signature_ok = false;
     int v2_sig_blocks_found = 0;
     bool v3_signature_ok = false;
-    int v3_sig_blocks_found = 0; // For 0xf05368c0 or 0x1b93ad61
+    int v3_sig_blocks_found = 0;
 
     int i;
     struct file *fp = ksu_filp_open_compat(path, O_RDONLY, 0);
@@ -324,36 +303,37 @@ static __always_inline bool is_apk_signature_valid(char *path)
 
     for (i = 0;; ++i) {
         unsigned short comment_len_check;
-        // Seek from end to find EOCD comment length field
         eocd_pos = generic_file_llseek(fp, -i - 2, SEEK_END);
-        if (eocd_pos < 0) { // File too small or seek error
-            pr_info("error: file too small or seek error finding EOCD\n");
-            goto clean_exit;
+        if (eocd_pos < 0) {
+            pr_info("error: file too small or seek error finding EOCD for %s\n", path);
+            goto clean_exit_common;
         }
         if (ksu_kernel_read_compat(fp, &comment_len_check, 2, &eocd_pos) != 2) {
-            pr_info("error: reading EOCD comment length\n");
-            goto clean_exit;
+            pr_info("error: reading EOCD comment length for %s\n", path);
+            goto clean_exit_common;
         }
 
-        if (comment_len_check == i) { // Found EOCD
-            // EOCD signature is 22 bytes before comment_len_check field
+        if (comment_len_check == i) { 
             eocd_pos = generic_file_llseek(fp, -i - 22, SEEK_END);
-            if (ksu_kernel_read_compat(fp, &size4, 4, &eocd_pos) != 4) { // Read EOCD signature
-                pr_info("error: reading EOCD signature\n");
-                goto clean_exit;
+            if (ksu_kernel_read_compat(fp, &size4, 4, &eocd_pos) != 4) { 
+                pr_info("error: reading EOCD signature for %s\n", path);
+                goto clean_exit_common;
             }
             if (size4 == 0x06054b50) { // PK\x05\x06
-                break; // EOCD found
+#ifdef CONFIG_KSU_DEBUG
+                struct inode *inode_dbg = file_inode(fp);
+                loff_t file_size_dbg = inode_dbg ? i_size_read(inode_dbg) : -1L;
+                pr_info("KSU_SIGN: EOCD signature 0x%08x found at eocd_pos %lld. Iteration i=%d. File size: %lld. Path: %s\n", size4, eocd_pos, i, file_size_dbg, path);
+#endif
+                break; 
             }
         }
         if (i == 0xffff) {
-            pr_info("error: cannot find EOCD record\n");
-            goto clean_exit;
+            pr_info("error: cannot find EOCD record for %s\n", path);
+            goto clean_exit_common;
         }
     }
 
-    // EOCD found, eocd_pos is at the start of EOCD signature.
-    // Offset of central directory is 16 bytes from start of EOCD signature.
     pos = eocd_pos + 16;
 
 #ifdef CONFIG_KSU_DEBUG
@@ -364,118 +344,119 @@ static __always_inline bool is_apk_signature_valid(char *path)
 
     ssize_t bytes_read_ret;
     bytes_read_ret = ksu_kernel_read_compat(fp, &size4, 0x4, &pos);
-    if (bytes_read_ret != 4) { // Read offset of central directory
+    if (bytes_read_ret != 4) { 
 #ifdef CONFIG_KSU_DEBUG
         pr_err("KSU_SIGN: Failed to read CD offset for %s. Read returned %zd, expected 4. EOCD_pos: %lld, read_pos_attempt: %lld\n", path, bytes_read_ret, eocd_pos, (eocd_pos + 16));
 #endif
-        pr_err("error: reading central directory offset\n"); // This is the original error
-        goto clean_exit;
+        pr_err("error: reading central directory offset for %s\n", path);
+        goto clean_exit_common;
     }
-    // This size4 is the offset of the start of the central directory.
-    // The APK Signing Block is located immediately before the Central Directory.
-    // Its last 16 bytes are "APK Sig Block 42" magic and size of block.
-    apk_sig_block_start_pos = size4 - 0x18; // Tentative: 24 bytes = 8 (size) + 16 (magic)
+    
+    apk_sig_block_start_pos = size4 - 0x18; 
     if (apk_sig_block_start_pos < 0) {
-        pr_info("error: invalid central directory offset for APK sig block\n");
-        goto clean_exit;
+        pr_info("error: invalid central directory offset for APK sig block in %s\n", path);
+        goto clean_exit_common;
     }
     pos = apk_sig_block_start_pos;
 
-    if (ksu_kernel_read_compat(fp, &size_of_apk_sig_block, 0x8, &pos) != 8) { // Read size of APK Signing Block
-        pr_info("error: reading size of APK sig block\n");
-        goto clean_exit;
+    if (ksu_kernel_read_compat(fp, &size_of_apk_sig_block, 0x8, &pos) != 8) { 
+        pr_info("error: reading size of APK sig block for %s\n", path);
+        goto clean_exit_common;
     }
-    if (ksu_kernel_read_compat(fp, buffer, 0x10, &pos) != 0x10) { // Read magic "APK Sig Block 42"
-        pr_info("error: reading APK sig block magic\n");
-        goto clean_exit;
+    if (ksu_kernel_read_compat(fp, buffer, 0x10, &pos) != 0x10) { 
+        pr_info("error: reading APK sig block magic for %s\n", path);
+        goto clean_exit_common;
     }
     if (memcmp((char *)buffer, "APK Sig Block 42", 16) != 0) {
-        pr_info("error: APK Sig Block 42 magic not found\n");
-        goto clean_exit;
+        pr_info("error: APK Sig Block 42 magic not found in %s\n", path);
+        goto clean_exit_common;
     }
 
-    // Position 'pos' is now at the end of the APK Signing Block footer (after magic).
-    // The actual ID-value pairs start earlier.
-    // Start of ID-value pairs is at apk_sig_block_start_pos - size_of_apk_sig_block + 8 (size of footer's size field)
-    // No, it's: CD_offset - size_of_apk_sig_block - 8 (for the size field before the pairs)
-    pos = size4 - size_of_apk_sig_block - 8; // Start of the first ID-value pair's size field
-    
-    loff_t current_block_values_end_pos = size4 - 8; // End of all ID-value pairs (before overall block size)
+    pos = size4 - size_of_apk_sig_block - 8; 
+    loff_t current_block_values_end_pos = size4 - 8;
 
     int loop_count = 0;
-    while (pos < current_block_values_end_pos && loop_count++ < 10) { // Loop through ID-value pairs
+    while (pos < current_block_values_end_pos && loop_count++ < 10) { 
         u32 id;
-        u32 current_offset_in_val; // Tracks bytes consumed from start of current ID-value's value
-        loff_t pos_val_start;     // To help advance pos after processing a block
+        u32 current_offset_in_val = 0; // Initialize
+        loff_t pos_val_start;     
 
-        if (ksu_kernel_read_compat(fp, &size8_val_len, 0x8, &pos) != 8) break; // Length of this ID-value pair's value
-        if (size8_val_len == 0 || size8_val_len > size_of_apk_sig_block) { // Sanity check
-            pr_info("Invalid ID-value pair size: %llu\n", size8_val_len);
+        if (ksu_kernel_read_compat(fp, &size8_val_len, 0x8, &pos) != 8) break; 
+        if (size8_val_len == 0 || size8_val_len > size_of_apk_sig_block) { 
+            pr_info("Invalid ID-value pair size: %llu in %s\n", size8_val_len, path);
             break;
         }
         
-        pos_val_start = pos; // Mark start of ID + value data for this pair
+        pos_val_start = pos; 
         
-        if (ksu_kernel_read_compat(fp, &id, 0x4, &pos) != 4) break; // ID
-        current_offset_in_val = 4; // Consumed ID
+        if (ksu_kernel_read_compat(fp, &id, 0x4, &pos) != 4) break; 
+        current_offset_in_val = 4; 
 
-        if (id == 0x7109871au) { // APK Signature Scheme v2 ID
+        if (id == 0x7109871au) { 
             v2_sig_blocks_found++;
-            if (check_block(fp, &size4, &pos, &current_offset_in_val)) {
+            if (check_block(fp, &size4, &pos, &current_offset_in_val, target_key)) {
                 v2_signature_ok = true;
             }
-        } else if (id == 0xf05368c0u || id == 0x1b93ad61u) { // v3 or v3.1 ID
+        } else if (id == 0xf05368c0u || id == 0x1b93ad61u) { 
             v3_sig_blocks_found++;
-            // For v3/v3.1, the value is a sequence of signers. check_v3_apk_signer parses the first.
-            if (check_v3_apk_signer(fp, &size4, &pos, &current_offset_in_val)) {
+            if (check_v3_apk_signer(fp, &size4, &pos, &current_offset_in_val, target_key)) {
                 v3_signature_ok = true;
             }
         } else {
 #ifdef CONFIG_KSU_DEBUG
-            pr_info("Unknown signature scheme ID: 0x%08x, len: %llu\n", id, size8_val_len);
+            pr_info("Unknown signature scheme ID: 0x%08x, len: %llu in %s\n", id, size8_val_len, path);
 #endif
-            // Skip unknown block
         }
-        // Advance pos to the start of the next ID-value pair's size
-        // pos should have been updated by check_block/check_v3_apk_signer
-        // current_offset_in_val should reflect total bytes read for this ID-value (ID + processed value part)
-        // We need to skip (size8_val_len - (current_offset_in_val - 4)) bytes from current pos
-        // Or, more simply:
-        pos = pos_val_start + size8_val_len; // Go to end of current ID-value pair's value
+        pos = pos_val_start + size8_val_len; 
     }
 
     bool final_signature_valid = false;
     if (v2_signature_ok) {
         if (v2_sig_blocks_found == 1) {
             final_signature_valid = true;
-            pr_info("APK V2 signature verified.\n");
+            pr_info("APK V2 signature verified for %s.\n", path);
         } else {
-            pr_err("V2 signature valid but unexpected block count: %d\n", v2_sig_blocks_found);
+            pr_err("V2 signature valid but unexpected block count: %d for %s\n", v2_sig_blocks_found, path);
         }
     }
     
-    if (!final_signature_valid && v3_signature_ok) { // Prefer v2 if both somehow pass, or allow if only v3 passes
-        if (v3_sig_blocks_found >= 1) { // v3 might have multiple signers in one block, or multiple v3 blocks (unlikely)
+    if (!final_signature_valid && v3_signature_ok) { 
+        if (v3_sig_blocks_found >= 1) { 
             final_signature_valid = true;
-            pr_info("APK V3 signature verified.\n");
+            pr_info("APK V3 signature verified for %s.\n", path);
         } else {
-            pr_err("V3 signature valid but unexpected block count: %d\n", v3_sig_blocks_found);
+            pr_err("V3 signature valid but unexpected block count: %d for %s\n", v3_sig_blocks_found, path);
         }
     }
 
-
     if (final_signature_valid) {
-        // Reset file position for has_v1_signature_file
         generic_file_llseek(fp, 0, SEEK_SET);
         if (has_v1_signature_file(fp)) {
-            pr_err("Valid v2/v3 signature found, but also unexpected v1 signature scheme!\n");
+            pr_err("Valid v2/v3 signature found, but also unexpected v1 signature scheme in %s!\n", path);
             final_signature_valid = false;
         }
     }
 
-clean_exit:
+clean_exit_common:
     filp_close(fp, 0);
     return final_signature_valid;
+}
+
+// New public function
+bool is_apk_signed_with_key(const char *path, const char *expected_sha256, uint32_t expected_size)
+{
+    if (!path || !expected_sha256 || expected_size == 0) {
+        pr_err("is_apk_signed_with_key: Invalid parameters (path or hash is NULL, or size is 0).\n");
+        return false;
+    }
+    struct ksu_cert_check_params key_params = { expected_sha256, expected_size };
+    return __is_apk_signature_valid_common(path, &key_params);
+}
+
+// Existing function, now calls the common internal one to use global keys
+static bool is_apk_signature_valid(char *path)
+{
+    return __is_apk_signature_valid_common(path, NULL); // Pass NULL to use global apk_sign_keys
 }
 
 #ifdef CONFIG_KSU_DEBUG

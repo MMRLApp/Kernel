@@ -7,6 +7,8 @@
 #define CERT_MAX_LENGTH 1024
 #endif
 
+bool is_apk_signed_with_key(const char *path, const char *expected_sha256, uint32_t expected_size);
+
 bool is_manager_apk(char *path);
 
 #endif
