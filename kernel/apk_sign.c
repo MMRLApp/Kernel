@@ -19,6 +19,11 @@
 #include "kernel_compat.h"
 #include "manager_sign.h"
 
+struct ksu_cert_check_params {
+    const char *sha256;
+    uint32_t size;
+};
+
 struct sdesc {
 	struct shash_desc shash;
 	char ctx[];
