@@ -3,6 +3,10 @@
 
 #include <linux/types.h>
 
+#ifndef CERT_MAX_LENGTH
+#define CERT_MAX_LENGTH 1024
+#endif
+
 bool is_manager_apk(char *path);
 
 #endif
