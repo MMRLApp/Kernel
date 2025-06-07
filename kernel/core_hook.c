@@ -266,16 +266,34 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 		return 0;
 	}
 
-	// TODO: find it in throne tracker!
-	uid_t current_uid_val = current_uid().val;
-	uid_t manager_uid = ksu_get_manager_uid();
-	if (current_uid_val != manager_uid &&
-	    current_uid_val % 100000 == manager_uid) {
-		ksu_set_manager_uid(current_uid_val);
-	}
+	uid_t current_caller_uid = current_uid().val;
+    uid_t crowned_manager_full_uid = ksu_get_manager_uid();
 
-	bool from_root = 0 == current_uid().val;
-	bool from_manager = is_manager();
+    // This section addresses the TODO:
+    // If a manager has been crowned by throne_tracker (i.e., ksu_manager_uid is valid),
+    // check if the current caller is that same manager app but running in a different user profile.
+    // The application part of the UID (UID % PER_USER_RANGE) will be the same.
+    // If so, update the global ksu_manager_uid to the current caller's full UID.
+    // This ensures that is_manager() will correctly identify the manager in its current profile context.
+    if (ksu_is_manager_uid_valid(crowned_manager_full_uid)) {
+        if (current_caller_uid != crowned_manager_full_uid &&
+            (current_caller_uid % PER_USER_RANGE) == (crowned_manager_full_uid % PER_USER_RANGE)) {
+            // The caller is the crowned manager app, but in a different user profile.
+            // Update the global manager UID to the caller's current full UID.
+            pr_info("KernelSU: Adjusting manager UID from %d to %d for current profile.\n",
+                crowned_manager_full_uid, current_caller_uid);
+            ksu_set_manager_uid(current_caller_uid);
+            // After this, ksu_get_manager_uid() will return current_caller_uid for subsequent checks
+            // within this prctl handler, like is_manager().
+        }
+    }
+    // Note: If no manager is crowned (crowned_manager_full_uid is KSU_INVALID_UID),
+    // or if the caller is not related to the crowned manager, ksu_manager_uid remains unchanged by this block.
+
+    bool from_root = (current_caller_uid == 0);
+    // is_manager() will now use ksu_get_manager_uid(), which might have been updated above
+    // to current_caller_uid if the conditions were met.
+    bool from_manager = is_manager();
 
 	if (!from_root && !from_manager) {
 		// only root or manager can access this interface
@@ -283,7 +301,8 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 	}
 
 #ifdef CONFIG_KSU_DEBUG
-	pr_info("option: 0x%x, cmd: %ld\n", option, arg2);
+    pr_info("option: 0x%x, cmd: %ld, from_root: %d, from_manager: %d, current_uid: %d, manager_uid: %d\n",
+        option, arg2, from_root, from_manager, current_caller_uid, ksu_get_manager_uid());
 #endif
 
 	if (arg2 == CMD_BECOME_MANAGER) {

@@ -4,6 +4,7 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
+#define PER_USER_RANGE 100000
 #define KERNEL_SU_VERSION KSU_VERSION
 #define KERNEL_SU_OPTION 0xDEADBEEF
 
